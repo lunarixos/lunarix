@@ -1,0 +1,5 @@
+if [ -r /etc/locale.conf ]; then
+    # shellcheck source=/dev/null
+    . /etc/locale.conf
+    export LANG
+fi

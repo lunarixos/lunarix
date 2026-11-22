@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+BUILD="$ROOT/build"
+VERSION="$(cat "$ROOT/config/kernel/version")"
+KERNEL="$BUILD/kernel/$VERSION/vmlinuz"
+GRUB_DIR="${GRUB_EFI_DIR:-/usr/lib/grub/x86_64-efi}"
+
+for tool in grub-mkrescue grub-mkstandalone xorriso mformat sfdisk mkfs.ext4 localedef loadkeys; do
+    command -v "$tool" >/dev/null || { echo "error: $tool is required" >&2; exit 1; }
+done
+[[ -f "$GRUB_DIR/modinfo.sh" ]] || { echo "error: missing x86-64 EFI GRUB modules in $GRUB_DIR" >&2; exit 1; }
+[[ -f /usr/share/zoneinfo/UTC ]] || { echo "error: install tzdata on the build host" >&2; exit 1; }
+if [[ ! -f "$BUILD/kernel-src/linux-$VERSION/Makefile" ]]; then
+    "$ROOT/scripts/bootstrap"
+fi
+"$ROOT/scripts/build-kernel"
+"$ROOT/scripts/build-live"
+
+ISO_ROOT="$(mktemp -d "$BUILD/.iso.XXXXXX")"
+ISO_IMAGE="$(mktemp "$BUILD/.lunarix.iso.XXXXXX")"
+trap 'rm -rf -- "$ISO_ROOT"; rm -f -- "$ISO_IMAGE"' EXIT
+
+install -Dm644 "$KERNEL" "$ISO_ROOT/boot/vmlinuz"
+install -Dm644 "$BUILD/live.cpio.gz" "$ISO_ROOT/boot/live.cpio.gz"
+install -Dm644 "$ROOT/live/grub.cfg" "$ISO_ROOT/boot/grub/grub.cfg"
+install -m 0644 "$BUILD/installed-root.tar.gz" "$ISO_ROOT/installed-root.tar.gz"
+
+SETUP="$ISO_ROOT/install-config"
+mkdir -p "$SETUP"/{locale,keymaps,zoneinfo}
+printf 'C\n' > "$SETUP/locales"
+for language in C en_US en_GB de_DE es_ES fr_FR; do
+    localedef --no-archive -i "$language" -f UTF-8 "$SETUP/locale/$language.utf8"
+    printf '%s.UTF-8\n' "$language" >> "$SETUP/locales"
+done
+for layout in us uk de es fr; do
+    loadkeys -u -b "$layout" > "$SETUP/keymaps/$layout.bmap"
+done
+rsync -aH --no-owner --no-group --exclude=/posix --exclude=/right --exclude=/localtime \
+    /usr/share/zoneinfo/ "$SETUP/zoneinfo/"
+
+grub-mkstandalone -d "$GRUB_DIR" -O x86_64-efi --locales="" --fonts="" \
+    --install-modules="normal configfile part_gpt fat linux serial terminal all_video" \
+    --modules="part_gpt fat" \
+    -o "$ISO_ROOT/boot/installed.efi" "boot/grub/grub.cfg=$ROOT/live/installed-grub.cfg"
+grub-mkrescue -d "$GRUB_DIR" -o "$ISO_IMAGE" "$ISO_ROOT" -- -volid LUNARIX_LIVE
+chmod 0644 "$ISO_IMAGE"
+mv -f -- "$ISO_IMAGE" "$BUILD/lunarix.iso"

@@ -1,0 +1,34 @@
+#!/bin/sh
+export PATH=/sbin:/bin:/usr/sbin:/usr/bin
+mount -t devtmpfs devtmpfs /dev
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+mkdir -p /run/live /dev/pts
+mount -t devpts devpts /dev/pts
+
+shell=/bin/sh
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+    for device in /dev/*; do
+        [ -b "$device" ] || continue
+        info=$(blkid "$device")
+        case "$info" in
+            *' LABEL="LUNARIX_LIVE"'*' TYPE="iso9660"'*|*' TYPE="iso9660"'*' LABEL="LUNARIX_LIVE"'*)
+                if mount -t iso9660 -o ro "$device" /run/live; then
+                    printf '%s\n' "$device" > /run/live-device
+                    break 2
+                fi
+                ;;
+        esac
+    done
+    sleep 1
+done
+
+if [ -s /run/live-device ]; then
+    echo 'Welcome to Lunarix Live. Run lunarix-install to install to disk.'
+else
+    echo 'Lunarix installation media could not be mounted.'
+fi
+
+while true; do
+    setsid cttyhack "$shell"
+done

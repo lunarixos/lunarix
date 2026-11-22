@@ -1,0 +1,17 @@
+#!/bin/sh
+export PATH=/sbin:/bin:/usr/sbin:/usr/bin
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+mkdir -p /dev/pts
+mount -t devpts devpts /dev/pts
+mount -t tmpfs -o mode=0755,nosuid,nodev tmpfs /run
+mount -o remount,rw /
+hostname -F /etc/hostname
+if [ -r /etc/vconsole.conf ]; then
+    # shellcheck source=/dev/null
+    . /etc/vconsole.conf
+    if [ -n "${KEYMAP:-}" ]; then
+        loadkmap < "/usr/share/keymaps/$KEYMAP.bmap" || echo "Could not load console keymap: $KEYMAP" >&2
+    fi
+fi
+ip link set lo up

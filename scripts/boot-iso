@@ -1,0 +1,114 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+ISO="$ROOT/build/lunarix.iso"
+VM_DIR="${LUNARIX_VM_DIR:-${LUNARA_VM_DIR:-$ROOT/build/qemu}}"
+DISK="$VM_DIR/lunarix.qcow2"
+VARS="$VM_DIR/OVMF_VARS.fd"
+if [[ ! -e "$DISK" && -f "$VM_DIR/lunara.qcow2" ]]; then
+    DISK="$VM_DIR/lunara.qcow2"
+fi
+
+usage() {
+    cat <<'USAGE'
+Usage: scripts/boot-iso [--installed] [--serial]
+
+Boot the live ISO by default. Use --installed to boot the saved disk alone.
+Use --serial for a terminal-only session, then select Lunarix Live (serial)
+in GRUB when booting the ISO. Press Ctrl+A, then X to close serial QEMU.
+
+LUNARIX_VM_DIR sets the directory for the guest disk and UEFI settings.
+Set OVMF_CODE and OVMF_VARS together to use a custom firmware pair.
+USAGE
+}
+
+installed=false
+serial=false
+for option in "$@"; do
+    case "$option" in
+        --installed) installed=true ;;
+        --serial) serial=true ;;
+        -h|--help) usage; exit 0 ;;
+        *) echo "error: unknown option: $option" >&2; usage >&2; exit 2 ;;
+    esac
+done
+
+if "$installed"; then
+    [[ -s "$DISK" ]] || {
+        echo "error: no QEMU disk at $DISK. Start with scripts/boot-iso and run lunarix-install in the guest." >&2
+        exit 1
+    }
+else
+    [[ -s "$ISO" ]] || {
+        echo "error: no live ISO at $ISO. Run scripts/build-iso first." >&2
+        exit 1
+    }
+fi
+
+for tool in qemu-system-x86_64 flock; do
+    command -v "$tool" >/dev/null || { echo "error: $tool is required" >&2; exit 1; }
+done
+
+code="${OVMF_CODE:-}"
+vars_template="${OVMF_VARS:-}"
+if [[ -z "$code" && -z "$vars_template" ]]; then
+    for directory in /usr/share/OVMF/x64 /usr/share/edk2/x64 /usr/share/edk2-ovmf/x64 \
+                     /usr/share/OVMF /usr/share/edk2/ovmf /usr/share/edk2-ovmf; do
+        for suffix in .4m _4M ''; do
+            if [[ -s "$directory/OVMF_CODE$suffix.fd" && -s "$directory/OVMF_VARS$suffix.fd" ]]; then
+                code="$directory/OVMF_CODE$suffix.fd"
+                vars_template="$directory/OVMF_VARS$suffix.fd"
+                break 2
+            fi
+        done
+    done
+fi
+[[ -s "$code" && -r "$code" && -s "$vars_template" && -r "$vars_template" ]] || {
+    echo 'error: install x86-64 OVMF firmware or set OVMF_CODE and OVMF_VARS to a matching pair.' >&2
+    exit 1
+}
+
+mkdir -p -- "$VM_DIR"
+exec 9>"$VM_DIR/launch.lock"
+flock -n 9 || { echo "error: a VM is already running in $VM_DIR" >&2; exit 1; }
+
+temp_file=
+trap 'if [[ -n "$temp_file" ]]; then rm -f -- "$temp_file"; fi' EXIT
+if [[ ! -e "$DISK" ]]; then
+    command -v qemu-img >/dev/null || { echo 'error: qemu-img is required to create the guest disk.' >&2; exit 1; }
+    temp_file="$(mktemp "$VM_DIR/.disk.XXXXXX")"
+    qemu-img create -q -f qcow2 "$temp_file" 2G
+    mv -- "$temp_file" "$DISK"
+    temp_file=
+fi
+if [[ ! -e "$VARS" ]]; then
+    temp_file="$(mktemp "$VM_DIR/.vars.XXXXXX")"
+    cat -- "$vars_template" > "$temp_file"
+    mv -- "$temp_file" "$VARS"
+    temp_file=
+fi
+
+args=(
+    -machine q35
+    -m 256M
+    -smp 2
+    -drive "if=pflash,format=raw,readonly=on,file=${code//,/,,}"
+    -drive "if=pflash,format=raw,file=${VARS//,/,,}"
+    -drive "if=virtio,format=qcow2,file=${DISK//,/,,}"
+    -netdev "user,id=net"
+    -device "virtio-net-pci,netdev=net"
+)
+if "$installed"; then
+    args+=(-boot order=c)
+    echo "==> Booting the installed disk: $DISK"
+else
+    args+=(-cdrom "$ISO" -boot order=d)
+    echo "==> Booting the live ISO: $ISO"
+    echo '    Inside the guest, run lunarix-install and select /dev/vda.'
+fi
+if "$serial"; then
+    args+=(-nographic)
+    echo '    Close QEMU with Ctrl+A, then X.'
+fi
+qemu-system-x86_64 "${args[@]}"

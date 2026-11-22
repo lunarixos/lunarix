@@ -1,0 +1,24 @@
+#!/bin/sh
+set -e
+interface=${interface:?missing DHCP interface}
+
+case "$1" in
+    deconfig)
+        ip link set dev "$interface" up
+        ip -4 addr flush dev "$interface"
+        ip -4 route flush dev "$interface"
+        ;;
+    bound|renew)
+        ip=${ip:?missing DHCP address}
+        ifconfig "$interface" "$ip" netmask "${subnet:-255.255.255.255}" up
+        for gateway in ${router:-}; do
+            ip -4 route replace default via "$gateway" dev "$interface"
+            break
+        done
+        if [ -n "${dns:-}" ]; then
+            for nameserver in $dns; do
+                printf 'nameserver %s\n' "$nameserver"
+            done > /etc/resolv.conf
+        fi
+        ;;
+esac

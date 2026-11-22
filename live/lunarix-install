@@ -1,0 +1,230 @@
+#!/bin/sh
+set -eu
+export PATH=/sbin:/bin:/usr/sbin:/usr/bin
+export LC_ALL=C
+
+media=/run/live
+setup=$media/install-config
+tools=/lib/install-tools
+
+fail() {
+    echo "lunarix-install: $*" >&2
+    exit 1
+}
+
+tool() {
+    program=$1
+    shift
+    "$tools/ld-linux-x86-64.so.2" --library-path "$tools" "$tools/$program" "$@"
+}
+
+disk_available() {
+    name=$1
+    block="/sys/class/block/$name"
+    case "$name" in
+        sd*|vd*|nvme*|mmcblk*) ;;
+        *) return 1 ;;
+    esac
+    [ -b "/dev/$name" ] && [ ! -e "$block/partition" ] || return 1
+    [ "$(cat "$block/ro")" = 0 ] && [ "$(cat "$block/size")" -ge 1048576 ] || return 1
+    for member in "$block" "$block"/*; do
+        [ -f "$member/dev" ] || continue
+        [ "$member" = "$block" ] || [ -f "$member/partition" ] || continue
+        [ "/dev/${member##*/}" != "$live_device" ] || return 1
+        for holder in "$member"/holders/*; do
+            [ ! -e "$holder" ] || return 1
+        done
+        major_minor=$(cat "$member/dev")
+        if awk -v dev="$major_minor" '$3 == dev { found = 1 } END { exit !found }' /proc/self/mountinfo ||
+            awk -v dev="/dev/${member##*/}" '$1 == dev { found = 1 } END { exit !found }' /proc/swaps; then
+            return 1
+        fi
+    done
+}
+
+[ "$(id -u)" = 0 ] || fail "run as root in Lunarix Live"
+[ -t 0 ] || fail "run the installer from an interactive terminal"
+[ -d /sys/firmware/efi ] || fail "boot the live image in UEFI mode"
+[ -s /run/live-device ] || fail "live media is unavailable"
+read -r live_device < /run/live-device
+[ -s "$media/installed-root.tar.gz" ] && [ -s "$media/boot/installed.efi" ] &&
+    [ -s "$media/boot/vmlinuz" ] || fail "live media is missing installation files"
+[ -s "$setup/locales" ] && [ -s "$setup/keymaps/us.bmap" ] &&
+    [ -s "$setup/zoneinfo/UTC" ] || fail "live media is missing system setup data"
+
+# A second installer must not race the target checks and partition writes.
+lock=/run/lunarix-install.lock
+mkdir "$lock" || fail "an installer is already running"
+target=
+tty_settings=
+keymap=us
+cleanup() {
+    if [ -n "$tty_settings" ]; then stty "$tty_settings" || :; fi
+    if [ "$keymap" != us ]; then loadkmap < "$setup/keymaps/us.bmap" || :; fi
+    if [ -n "$target" ]; then
+        if mountpoint -q "$target/boot/efi"; then umount "$target/boot/efi" || return; fi
+        if mountpoint -q "$target"; then umount "$target" || return; fi
+        rmdir "$target" || :
+    fi
+    rmdir "$lock" || :
+}
+trap cleanup EXIT
+trap 'exit 1' HUP INT TERM
+
+echo 'Available whole disks (at least 512 MiB):'
+found=false
+for block_path in /sys/class/block/*; do
+    candidate=${block_path##*/}
+    if disk_available "$candidate"; then
+        printf '  /dev/%s  %s MiB\n' "$candidate" "$(( $(cat "$block_path/size") / 2048 ))"
+        found=true
+    fi
+done
+[ "$found" = true ] || fail "no eligible target disks"
+printf 'Target disk (for example /dev/vda): '
+read -r disk
+case "$disk" in
+    /dev/*) name=${disk#/dev/} ;;
+    *) fail "enter a disk path from the list" ;;
+esac
+case "$name" in */*|''|.|..) fail "enter a disk path from the list" ;; esac
+disk_available "$name" || fail "$disk is unavailable"
+
+echo 'Console keyboard layouts: us uk de es fr'
+while true; do
+    printf 'Console keyboard layout [us]: '
+    read -r answer
+    case "${answer:-us}" in
+        us|uk|de|es|fr) keymap=${answer:-us}; break ;;
+        *) echo 'Choose one of the listed layouts.' ;;
+    esac
+done
+if [ "$keymap" != us ]; then
+    loadkmap < "$setup/keymaps/$keymap.bmap" || fail "could not load $keymap on the live console"
+    echo "The local console now uses $keymap."
+fi
+
+while true; do
+    printf 'Hostname [lunarix]: '
+    read -r answer
+    hostname=${answer:-lunarix}
+    case "$hostname" in
+        -*|*-|*[!a-z0-9-]*) ;;
+        *) if [ "${#hostname}" -le 63 ]; then break; fi ;;
+    esac
+    echo 'Use up to 63 lowercase letters, digits, or hyphens, with no leading or trailing hyphen.'
+done
+
+printf 'Locales available: '
+xargs < "$setup/locales"
+while true; do
+    printf 'Locale [C.UTF-8]: '
+    read -r answer
+    language=${answer:-C.UTF-8}
+    if grep -Fxq -e "$language" "$setup/locales"; then break; fi
+    echo 'Choose one of the listed locales.'
+done
+
+while true; do
+    printf 'Time zone [UTC] (for example America/Chicago or Europe/Berlin): '
+    read -r answer
+    timezone=${answer:-UTC}
+    case "$timezone" in
+        .*|/*|*..*|*[!A-Za-z0-9_+./-]*) ;;
+        *) if [ -f "$setup/zoneinfo/$timezone" ] &&
+               [ "$(head -c 4 "$setup/zoneinfo/$timezone")" = TZif ]; then break; fi ;;
+    esac
+    echo 'Enter a valid time zone from the IANA time zone database.'
+done
+
+while true; do
+    printf 'Login username: '
+    read -r username
+    case "$username" in
+        root|[!a-z]*|*[!a-z0-9_-]*|'') ;;
+        *) if [ "${#username}" -le 32 ]; then break; fi ;;
+    esac
+    echo 'Use up to 32 lowercase letters, digits, hyphens, or underscores. Begin with a letter and choose a name other than root.'
+done
+
+printf '\nDisk: %s\nHostname: %s\nLocale: %s\nTime zone: %s\nKeyboard: %s\nUser: %s\n\n' \
+    "$disk" "$hostname" "$language" "$timezone" "$keymap" "$username"
+printf 'All data on %s will be erased. Type ERASE %s to continue: ' "$disk" "$disk"
+read -r confirmation
+[ "$confirmation" = "ERASE $disk" ] || fail "confirmation did not match"
+disk_available "$name" || fail "$disk is no longer available"
+
+target=$(mktemp -d /mnt/lunarix.XXXXXX)
+root_partuuid=$(cat /proc/sys/kernel/random/uuid)
+root_uuid=$(cat /proc/sys/kernel/random/uuid)
+tool sfdisk --wipe always --wipe-partitions always "$disk" <<PARTITIONS
+label: gpt
+size=128MiB, type=uefi
+type=linux, uuid=$root_partuuid
+PARTITIONS
+case "$disk" in
+    *[0-9]) partition_prefix="${disk}p" ;;
+    *) partition_prefix=$disk ;;
+esac
+esp="${partition_prefix}1"
+root="${partition_prefix}2"
+for _ in 1 2 3 4 5; do
+    if [ -b "$esp" ] && [ -b "$root" ]; then break; fi
+    sleep 1
+done
+[ -b "$esp" ] && [ -b "$root" ] || fail "new partition devices did not appear"
+
+mkfs.vfat -F 32 -n LUNARIX_EFI "$esp"
+tool mkfs.ext4 -q -U "$root_uuid" -L lunarix "$root"
+mount -t ext4 "$root" "$target"
+tar -xzf "$media/installed-root.tar.gz" -C "$target"
+mount -t vfat "$esp" "$target/boot/efi"
+cat > "$target/etc/fstab" <<FSTAB
+UUID=$root_uuid / ext4 defaults 0 1
+FSTAB
+printf '%s\n' "$hostname" > "$target/etc/hostname"
+printf '127.0.0.1 localhost\n::1 localhost\n127.0.1.1 %s\n' "$hostname" > "$target/etc/hosts"
+printf 'LANG=%s\n' "$language" > "$target/etc/locale.conf"
+if [ "$language" != C ]; then
+    locale_dir="${language%.UTF-8}.utf8"
+    mkdir -p "$target/usr/lib/locale"
+    cp -r "$setup/locale/$locale_dir" "$target/usr/lib/locale/"
+fi
+install -m 0644 "$setup/zoneinfo/$timezone" "$target/etc/localtime"
+printf '%s\n' "$timezone" > "$target/etc/timezone"
+mkdir -p "$target/usr/share/keymaps"
+install -m 0644 "$setup/keymaps/$keymap.bmap" "$target/usr/share/keymaps/$keymap.bmap"
+printf 'KEYMAP=%s\n' "$keymap" > "$target/etc/vconsole.conf"
+
+chroot "$target" /usr/sbin/adduser -D -s /bin/sh "$username"
+tty_settings=$(stty -g)
+stty -echo
+echo "Set the password for $username."
+chroot "$target" /usr/bin/passwd -a sha512 "$username"
+echo 'Set the root password for system maintenance.'
+chroot "$target" /usr/bin/passwd -a sha512 root
+stty "$tty_settings"
+tty_settings=
+for account in "$username" root; do
+    awk -F: -v name="$account" '$1 == name && $2 ~ /^\$/ { found = 1 } END { exit !found }' "$target/etc/shadow" ||
+        fail "a password was not saved for $account"
+done
+
+mkdir -p "$target/boot/efi/EFI/BOOT"
+cp "$media/boot/vmlinuz" "$target/boot/efi/EFI/BOOT/vmlinuz"
+cat > "$target/boot/efi/EFI/BOOT/lunarix.cfg" <<GRUB
+set default=0
+set timeout=1
+insmod all_video
+set gfxpayload=keep
+serial --unit=0 --speed=115200
+terminal_output console serial
+menuentry 'Lunarix' {
+    linux "\${cmdpath}/vmlinuz" root=PARTUUID=$root_partuuid rootwait rw console=ttyS0,115200n8 console=tty0 loglevel=3
+}
+GRUB
+cp "$media/boot/installed.efi" "$target/boot/efi/EFI/BOOT/BOOTX64.EFI"
+sync
+umount "$target/boot/efi"
+umount "$target"
+echo 'Lunarix is installed. Power off, remove the live media, and boot from the target disk.'

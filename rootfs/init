@@ -1,0 +1,12 @@
+#!/bin/sh
+mount -t devtmpfs devtmpfs /dev
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+
+# boot msg
+echo "Welcome to Lunarix!"
+
+while true; do
+    setsid cttyhack sh
+    echo "Shell exited. Restarting..."
+done
