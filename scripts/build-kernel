@@ -22,6 +22,7 @@ fi
 VERSION="$(tr -d '[:space:]' < "$VERSION_FILE")"
 SOURCE_DIR="$SOURCE_PARENT/linux-$VERSION"
 ARTIFACT_VERSION_DIR="$ARTIFACT_DIR/$VERSION"
+LOCALVERSION="${LUNARIX_KERNEL_LOCALVERSION:-$(cat "$PROJECT_ROOT/config/kernel/localversion")}"
 
 for cmd in make install depmod; do
     if ! command -v "$cmd" >/dev/null 2>&1; then
@@ -43,7 +44,7 @@ cp "$CONFIG_FILE" "$OUTPUT_DIR/.config"
 
 make -C "$SOURCE_DIR" \
     O="$OUTPUT_DIR" \
-    ARCH=x86_64 \
+    ARCH=x86_64 LOCALVERSION="$LOCALVERSION" \
     olddefconfig
 
 cp "$OUTPUT_DIR/.config" "$CONFIG_FILE"
@@ -52,7 +53,7 @@ echo "==> Building kernel and modules"
 
 make -C "$SOURCE_DIR" \
     O="$OUTPUT_DIR" \
-    ARCH=x86_64 \
+    ARCH=x86_64 LOCALVERSION="$LOCALVERSION" \
     -j"$(nproc)" \
     bzImage modules
 
@@ -71,16 +72,21 @@ install -Dm644 \
     "$ARTIFACT_VERSION_DIR/config"
 
 echo "==> Installing modules"
+kernel_release="$(cat "$OUTPUT_DIR/include/config/kernel.release")"
+module_stage="$(mktemp -d "$ARTIFACT_VERSION_DIR/.modules.XXXXXX")"
+trap 'rm -rf -- "$module_stage"' EXIT
 
 make -C "$SOURCE_DIR" \
     O="$OUTPUT_DIR" \
-    ARCH=x86_64 \
-    INSTALL_MOD_PATH="$ARTIFACT_VERSION_DIR/modules" \
+    ARCH=x86_64 LOCALVERSION="$LOCALVERSION" \
+    INSTALL_MOD_PATH="$module_stage" \
     modules_install
 
 echo "==> Generating module dependency metadata"
 
-depmod -b "$ARTIFACT_VERSION_DIR/modules" "$VERSION"
+depmod -b "$module_stage" "$kernel_release"
+rm -rf -- "$ARTIFACT_VERSION_DIR/modules"
+mv -- "$module_stage" "$ARTIFACT_VERSION_DIR/modules"
 
 echo
 echo "==> Kernel build complete"

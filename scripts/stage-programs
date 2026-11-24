@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+destination=$1
+shift
+for binary; do
+    install -Dm755 "$binary" "$destination/${binary##*/}"
+    dependencies="$(LC_ALL=C ldd "$binary")"
+    if [[ "$dependencies" == *"not found"* ]]; then
+        echo "error: missing runtime libraries for $binary" >&2
+        exit 1
+    fi
+    while read -r name path; do
+        install -m 0755 "$path" "$destination/$name"
+    done < <(awk '{ n = split($1, p, "/") }
+                  $2 == "=>" && $3 ~ /^\// {print p[n], $3; next}
+                  $1 ~ /^\// {print p[n], $1}' <<< "$dependencies")
+done
+[[ -x "$destination/ld-linux-x86-64.so.2" ]] || {
+    echo "error: expected an x86-64 glibc loader in $destination" >&2
+    exit 1
+}

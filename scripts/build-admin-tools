@@ -1,0 +1,106 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+pkgr=$1
+dist=$2
+system_repo=$3
+optional_repo=$4
+mkdir -p "$dist" "$system_repo" "$optional_repo"
+work="$(mktemp -d)"
+trap 'rm -rf -- "$work"' EXIT
+
+extract() {
+    local url=$1 checksum=$2 file="$dist/${1##*/}"
+    if [[ ! -s "$file" ]]; then
+        curl --fail --location --retry 3 --output "$work/download" "$url"
+        printf '%s  %s\n' "$checksum" "$work/download" | sha256sum -c -
+        mv -- "$work/download" "$file"
+    fi
+    printf '%s  %s\n' "$checksum" "$file" | sha256sum -c -
+    tar -xf "$file" -C "$work"
+}
+
+extract https://github.com/besser82/libxcrypt/releases/download/v4.4.38/libxcrypt-4.4.38.tar.xz \
+    80304b9c306ea799327f01d9a7549bdb28317789182631f1b54f4511b4206dd6
+extract https://github.com/Duncaen/OpenDoas/releases/download/v6.8.2/opendoas-6.8.2.tar.xz \
+    4e98828056d6266bd8f2c93e6ecf12a63a71dbfd70a5ea99ccd4ab6d0745adf0
+extract https://www.sudo.ws/dist/sudo-1.9.17p2.tar.gz \
+    4a38a1ab3adb1199257edc2a7c4a2bd714665eb605b04368843b06dada2cfcfb
+
+(
+    cd "$work/libxcrypt-4.4.38"
+    ./configure --disable-shared --enable-static --disable-obsolete-api --disable-werror
+    make -j"$(nproc)" libcrypt.la
+)
+(
+    cd "$work/opendoas-6.8.2"
+    LDFLAGS="-L$work/libxcrypt-4.4.38/.libs" ./configure --with-shadow --enable-static --prefix=/usr
+    make -j"$(nproc)" LDFLAGS="-L$work/libxcrypt-4.4.38/.libs -s"
+)
+stage="$work/opendoas-stage"
+install -Dm4755 "$work/opendoas-6.8.2/doas" "$stage/usr/bin/doas"
+install -Dm644 "$work/opendoas-6.8.2/doas.1" "$stage/usr/share/man/man1/doas.1"
+install -Dm644 "$work/opendoas-6.8.2/doas.conf.5" "$stage/usr/share/man/man5/doas.conf.5"
+for file in LICENSING COPYING.LIB; do
+    install -Dm644 "$work/libxcrypt-4.4.38/$file" "$stage/usr/share/licenses/opendoas/libxcrypt-$file"
+done
+for file in LICENSE COPYING; do
+    if [[ -f "$work/opendoas-6.8.2/$file" ]]; then
+        install -Dm644 "$work/opendoas-6.8.2/$file" "$stage/usr/share/licenses/opendoas/$file"
+    fi
+done
+manifest="$work/package.info"
+cat >"$manifest" <<'MANIFEST'
+name=opendoas
+version=6.8.2-1
+arch=x86_64
+description=Run authorized commands as another user
+depend=lunarix-busybox
+config=etc/doas.conf
+MANIFEST
+mkdir -p "$stage/etc"
+printf 'permit :netadmin as root cmd /usr/sbin/lunarix-net\n' > "$stage/etc/doas.conf"
+chmod 0600 "$stage/etc/doas.conf"
+archive="$(cd "$work" && "$pkgr" pack "$manifest" "$stage")"
+install -m644 "$work/$archive" "$optional_repo/$archive"
+
+(
+    cd "$work/sudo-1.9.17p2"
+    LDFLAGS="-static -L$work/libxcrypt-4.4.38/.libs" ./configure --prefix=/usr \
+        --sysconfdir=/etc --without-pam --disable-nls --disable-shared --disable-zlib \
+        --disable-openssl --disable-log-server --disable-pie \
+        --with-rundir=/run/sudo --with-vardir=/var/lib/sudo
+    make -j"$(nproc)" LDFLAGS="-L$work/libxcrypt-4.4.38/.libs -Wc,-static-pie"
+)
+
+sudo_source="$work/sudo-1.9.17p2"
+stage="$work/sudo-stage"
+headers="$(readelf -l "$sudo_source/src/sudo" "$sudo_source/plugins/sudoers/visudo")"
+if [[ "$headers" == *INTERP* ]]; then
+    echo "error: sudo and visudo must link without a dynamic loader" >&2
+    exit 1
+fi
+install -s -Dm4755 "$sudo_source/src/sudo" "$stage/usr/bin/sudo"
+install -s -Dm755 "$sudo_source/plugins/sudoers/visudo" "$stage/usr/sbin/visudo"
+install -Dm644 "$sudo_source/LICENSE.md" "$stage/usr/share/licenses/sudo/LICENSE.md"
+for file in LICENSING COPYING.LIB; do
+    install -Dm644 "$work/libxcrypt-4.4.38/$file" "$stage/usr/share/licenses/sudo/libxcrypt-$file"
+done
+mkdir -p "$stage/etc"
+cat > "$stage/etc/sudoers" <<'SUDOERS'
+Defaults secure_path="/usr/sbin:/usr/bin:/sbin:/bin"
+root ALL=(ALL:ALL) ALL
+%netadmin ALL=(root) /usr/sbin/lunarix-net
+SUDOERS
+chmod 0440 "$stage/etc/sudoers"
+"$sudo_source/plugins/sudoers/visudo" -cf "$stage/etc/sudoers"
+cat > "$manifest" <<'MANIFEST'
+name=sudo
+version=1.9.17p2-1
+arch=x86_64
+description=Run authorized commands as another user
+depend=lunarix-busybox
+config=etc/sudoers
+MANIFEST
+archive="$(cd "$work" && "$pkgr" pack "$manifest" "$stage")"
+install -m644 "$work/$archive" "$system_repo/$archive"

@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if (($# != 2)); then
+    echo 'Usage: scripts/build-repository SNAPSHOT_DIR SIGNING_KEY' >&2
+    exit 2
+fi
+root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+destination="$(realpath -m "$1")"
+key="$(realpath -e "$2")"
+build="$root/build"
+pkgr="$build/base-root/usr/bin/pkgr"
+[[ ! -e "$destination" && ! -L "$destination" ]] || {
+    echo "error: snapshot already exists: $destination" >&2
+    exit 1
+}
+[[ -x "$pkgr" && -d "$build/system-repo" ]] || {
+    echo 'error: build the Lunarix ISO first' >&2
+    exit 1
+}
+mkdir -p "$(dirname "$destination")"
+work="$(mktemp -d "$(dirname "$destination")/.lunarix-repo.XXXXXX")"
+trap 'rm -rf -- "$work"' EXIT
+if [[ -n "${PKGR_SEED_DIR:-}" ]]; then
+    shopt -s nullglob
+    for package in "$PKGR_SEED_DIR"/*.pkgr.tar.gz; do
+        install -m644 "$package" "$work/"
+    done
+fi
+install -m644 "$build"/system-repo/*.pkgr.tar.gz "$work/"
+install -m644 "$build"/base-root/usr/share/pkgr/repo/*.pkgr.tar.gz "$work/"
+version="$("$pkgr" --version)"
+install -m644 "$build/pkgr-update.pkgr.tar.gz" "$work/pkgr-${version#pkgr }.x86_64.pkgr.tar.gz"
+"$pkgr" index "$work" > "$work/index.tsv"
+openssl dgst -sha256 -sign "$key" -out "$work/index.tsv.sig" "$work/index.tsv"
+chmod 0755 "$work"
+mv -Tn -- "$work" "$destination"
+[[ ! -e "$work" ]] || { echo "error: snapshot already exists: $destination" >&2; exit 1; }

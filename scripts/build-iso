@@ -3,6 +3,7 @@ set -euo pipefail
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 BUILD="$ROOT/build"
+ISO="${LUNARIX_ISO:-$BUILD/lunarix.iso}"
 VERSION="$(cat "$ROOT/config/kernel/version")"
 KERNEL="$BUILD/kernel/$VERSION/vmlinuz"
 GRUB_DIR="${GRUB_EFI_DIR:-/usr/lib/grub/x86_64-efi}"
@@ -16,16 +17,39 @@ if [[ ! -f "$BUILD/kernel-src/linux-$VERSION/Makefile" ]]; then
     "$ROOT/scripts/bootstrap"
 fi
 "$ROOT/scripts/build-kernel"
+grub-mkstandalone -d "$GRUB_DIR" -O x86_64-efi --locales="" --fonts="" \
+    --install-modules="normal configfile part_gpt fat linux serial terminal all_video" \
+    --modules="part_gpt fat" \
+    -o "$BUILD/installed.efi" "boot/grub/grub.cfg=$ROOT/live/installed-grub.cfg"
 "$ROOT/scripts/build-live"
 
 ISO_ROOT="$(mktemp -d "$BUILD/.iso.XXXXXX")"
-ISO_IMAGE="$(mktemp "$BUILD/.lunarix.iso.XXXXXX")"
+ISO_IMAGE="$(mktemp "$(dirname -- "$ISO")/.lunarix.iso.XXXXXX")"
 trap 'rm -rf -- "$ISO_ROOT"; rm -f -- "$ISO_IMAGE"' EXIT
 
 install -Dm644 "$KERNEL" "$ISO_ROOT/boot/vmlinuz"
 install -Dm644 "$BUILD/live.cpio.gz" "$ISO_ROOT/boot/live.cpio.gz"
 install -Dm644 "$ROOT/live/grub.cfg" "$ISO_ROOT/boot/grub/grub.cfg"
 install -m 0644 "$BUILD/installed-root.tar.gz" "$ISO_ROOT/installed-root.tar.gz"
+cp -a "$BUILD/system-repo" "$ISO_ROOT/system"
+if [[ -n "${LUNARIX_LEGACY_ISO:-}" ]]; then
+    "$ROOT/scripts/package-legacy" "$LUNARIX_LEGACY_ISO" "$ISO_ROOT/migration"
+fi
+install -m 0644 "$BUILD/network.squashfs" "$ISO_ROOT/network.squashfs"
+install -Dm644 "$BUILD/pkgr-update.pkgr.tar.gz" "$ISO_ROOT/packages/pkgr-update.pkgr.tar.gz"
+
+if [[ -n "${PKGR_SEED_DIR:-}" ]]; then
+    if [[ ! -d "$PKGR_SEED_DIR" ]]; then
+        echo "error: package seed directory does not exist: $PKGR_SEED_DIR" >&2
+        exit 1
+    fi
+    for package in "$PKGR_SEED_DIR"/*.pkgr.tar.gz; do
+        [[ -f "$package" ]] || continue
+        name=${package##*/}
+        [[ ! -e "$BUILD/base-root/usr/share/pkgr/repo/$name" ]] || continue
+        install -Dm644 "$package" "$ISO_ROOT/packages/$name"
+    done
+fi
 
 SETUP="$ISO_ROOT/install-config"
 mkdir -p "$SETUP"/{locale,keymaps,zoneinfo}
@@ -40,10 +64,6 @@ done
 rsync -aH --no-owner --no-group --exclude=/posix --exclude=/right --exclude=/localtime \
     /usr/share/zoneinfo/ "$SETUP/zoneinfo/"
 
-grub-mkstandalone -d "$GRUB_DIR" -O x86_64-efi --locales="" --fonts="" \
-    --install-modules="normal configfile part_gpt fat linux serial terminal all_video" \
-    --modules="part_gpt fat" \
-    -o "$ISO_ROOT/boot/installed.efi" "boot/grub/grub.cfg=$ROOT/live/installed-grub.cfg"
 grub-mkrescue -d "$GRUB_DIR" -o "$ISO_IMAGE" "$ISO_ROOT" -- -volid LUNARIX_LIVE
 chmod 0644 "$ISO_IMAGE"
-mv -f -- "$ISO_IMAGE" "$BUILD/lunarix.iso"
+mv -f -- "$ISO_IMAGE" "$ISO"

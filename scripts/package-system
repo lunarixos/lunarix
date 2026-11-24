@@ -1,0 +1,88 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+pkgr=$1
+source=$2
+repo=$3
+version=$4
+kernel=${5:-}
+loader=${6:-}
+root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+mkdir -p "$repo"
+repo="$(realpath "$repo")"
+work="$(mktemp -d)"
+trap 'rm -rf -- "$work"' EXIT
+
+reset_stage() {
+    rm -rf -- "$work/stage"
+    mkdir "$work/stage"
+}
+
+stage_path() {
+    rsync -aR -- "$source/./$1" "$work/stage/"
+}
+
+pack() {
+    local name=$1 arch=$2
+    shift 2
+    {
+        printf 'name=%s\nversion=%s\narch=%s\nessential=yes\n' "$name" "$version" "$arch"
+        if (($#)); then printf '%s\n' "$@"; fi
+    } > "$work/manifest"
+    local archive
+    archive="$(cd "$work" && "$pkgr" pack manifest stage)"
+    install -m644 "$work/$archive" "$repo/$archive"
+}
+
+reset_stage
+stage_path bin
+stage_path sbin
+while IFS= read -r -d '' applet; do
+    stage_path "${applet#"$source/"}"
+done < <(find "$source/usr/bin" "$source/usr/sbin" -maxdepth 1 -type l -print0)
+pack lunarix-busybox x86_64
+
+reset_stage
+for path in init.d/rcS inittab os-release profile securetty; do
+    stage_path "etc/$path"
+done
+pack lunarix-base noarch depend=lunarix-busybox config=etc/inittab \
+    config=etc/profile config=etc/securetty config=etc/init.d/rcS
+
+reset_stage
+for tool in wpa_supplicant wpa_cli wpa_passphrase openssl curl; do
+    if [[ -f "$source/usr/bin/$tool" ]]; then stage_path "usr/bin/$tool"; fi
+done
+stage_path usr/lib/lunarix/network
+stage_path usr/sbin/lunarix-net
+stage_path usr/share/udhcpc/default.script
+pack lunarix-net x86_64 depend=lunarix-busybox depend=lunarix-ca-certificates
+
+reset_stage
+stage_path usr/share/lunarix/ca-certificates.crt
+pack lunarix-ca-certificates noarch
+
+reset_stage
+stage_path lib/firmware
+pack lunarix-firmware noarch
+
+[[ -n "$kernel" && -n "$loader" ]] || exit 0
+
+reset_stage
+boot="$work/stage/usr/lib/lunarix/boot"
+install -Dm755 "$root/installed-root/usr/sbin/lunarix-boot-update" "$work/stage/usr/sbin/lunarix-boot-update"
+install -Dm644 "$loader" "$boot/BOOTX64.EFI"
+pack lunarix-boot x86_64 depend=lunarix-busybox
+
+reset_stage
+modules=("$kernel"/modules/lib/modules/*)
+[[ "${#modules[@]}" == 1 && -d "${modules[0]}" ]] || { echo 'error: expected one kernel module release' >&2; exit 1; }
+install -Dm644 "$kernel/vmlinuz" "$boot/vmlinuz"
+printf '%s\n' "${modules[0]##*/}" > "$boot/kernel-release"
+mkdir -p "$boot/modules"
+rsync -a --exclude=build --exclude=source "${modules[0]}/" "$boot/modules/"
+(
+    cd "$boot/modules"
+    find . -type f -print0 | sort -z | xargs -0 sha256sum
+) > "$boot/modules.sha256"
+pack linux-lunarix x86_64 depend=lunarix-boot depend=lunarix-firmware

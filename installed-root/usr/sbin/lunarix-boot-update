@@ -1,0 +1,162 @@
+#!/bin/sh
+set -eu
+export PATH=/sbin:/bin:/usr/sbin:/usr/bin
+
+fail() { printf 'lunarix-boot-update: %s\n' "$*" >&2; exit 1; }
+
+state=/etc/lunarix/boot.conf
+bundle=/usr/lib/lunarix/boot
+esp=/boot/efi
+boot=$esp/EFI/BOOT
+mounted=false
+
+[ "$(id -u)" = 0 ] || fail "run as root"
+[ -r "$state" ] || fail "boot partition configuration is missing"
+read -r esp_uuid root_partuuid extra < "$state"
+case "$esp_uuid:$root_partuuid" in
+    *[!a-fA-F0-9:-]*|:*|*:) fail "invalid boot partition identifiers" ;;
+esac
+[ -z "$extra" ] && [ "${#root_partuuid}" = 36 ] || fail "invalid root partition identifier"
+
+cleanup() {
+    if [ -n "${work:-}" ]; then rm -rf -- "$work"; fi
+    if "$mounted"; then umount "$esp"; fi
+}
+trap cleanup EXIT
+trap 'exit 1' HUP INT TERM
+
+case "${1:-}" in
+    '') exec 9>/run/lunarix-boot.lock; flock -x 9 ;;
+    --mounted) [ "$#" = 1 ] || fail "unexpected arguments" ;;
+    *) fail "unexpected arguments" ;;
+esac
+
+if ! mountpoint -q "$esp"; then
+    [ "${1:-}" != --mounted ] || fail "installer did not mount the EFI partition"
+    mount -t vfat -o rw "UUID=$esp_uuid" "$esp"
+    mounted=true
+fi
+# The recognized device must match the mounted filesystem before EFI writes.
+if [ "${1:-}" != --mounted ]; then
+    expected_device=$(findfs "UUID=$esp_uuid")
+    expected_id=$(stat -L -c '%t:%T' "$expected_device")
+    set -- ${expected_id%:*} ${expected_id#*:}
+    mount_id="$(printf '%d:%d' "0x$1" "0x$2")"
+    awk -v device="$mount_id" '$3 == device && $5 == "/boot/efi" { found = 1 } END { exit !found }' \
+        /proc/self/mountinfo || fail "the mounted EFI partition does not match boot.conf"
+fi
+
+read -r release < "$bundle/kernel-release"
+case "$release" in ''|*[!a-zA-Z0-9._+-]*|.*) fail "invalid kernel release" ;; esac
+moddir=/lib/modules/$release
+mkdir -p /lib/modules "$boot"
+if [ -e "$moddir" ]; then
+    [ -d "$moddir" ] && [ ! -L "$moddir" ] || fail "invalid module directory $moddir"
+    (cd "$moddir" && sha256sum -c -s "$bundle/modules.sha256") ||
+        fail "module files for $release differ. Give the updated kernel a new release string"
+else
+    work=$(mktemp -d /lib/modules/.lunarix.XXXXXX)
+    cp -a "$bundle/modules/." "$work/"
+    touch "$work/.lunarix-managed"
+    chmod 0755 "$work"
+    sync
+    mv "$work" "$moddir"
+    work=
+fi
+
+digest=$(sha256sum "$bundle/vmlinuz")
+digest=${digest%% *}
+kernel="lunarix-$digest.efi-kernel"
+current=
+previous=
+current_release=
+previous_release=
+running=
+if [ -r /proc/cmdline ]; then
+    running=$(awk '{for (i=1; i<=NF; i++) if ($i ~ /^lunarix.kernel=/) {
+        sub(/^lunarix.kernel=/, "", $i); print $i; exit
+    }}' /proc/cmdline)
+fi
+if [ -r "$boot/lunarix.cfg" ]; then
+    current=$(sed -n 's/^# lunarix-current //p' "$boot/lunarix.cfg")
+    previous=$(sed -n 's/^# lunarix-previous //p' "$boot/lunarix.cfg")
+    current_release=$(sed -n 's/^# lunarix-current-release //p' "$boot/lunarix.cfg")
+    previous_release=$(sed -n 's/^# lunarix-previous-release //p' "$boot/lunarix.cfg")
+    if [ -z "$current" ] && [ -f "$boot/vmlinuz" ]; then
+        current=vmlinuz
+        current_release=$(uname -r)
+    fi
+fi
+for file in "$current" "$previous"; do
+    case "$file" in
+        ''|vmlinuz|lunarix-*.efi-kernel) ;;
+        *) fail "invalid installed kernel name" ;;
+    esac
+    case "$file" in *[!a-zA-Z0-9._-]*) fail "invalid installed kernel name" ;; esac
+done
+for version in "$current_release" "$previous_release"; do
+    case "$version" in *[!a-zA-Z0-9._+-]*|.*) fail "invalid installed module release" ;; esac
+done
+
+replace_file() {
+    cp -- "$1" "$2.next"
+    sync
+    mv -f -- "$2.next" "$2"
+    sync
+}
+
+if ! cmp -s "$bundle/BOOTX64.EFI" "$boot/BOOTX64.EFI"; then
+    if [ -f "$boot/BOOTX64.EFI" ]; then
+        replace_file "$boot/BOOTX64.EFI" "$boot/BOOTX64.PREV.EFI"
+    fi
+    replace_file "$bundle/BOOTX64.EFI" "$boot/BOOTX64.EFI"
+fi
+if ! cmp -s "$bundle/vmlinuz" "$boot/$kernel"; then
+    replace_file "$bundle/vmlinuz" "$boot/$kernel"
+fi
+if [ "$current" != "$kernel" ]; then
+    [ -z "$current" ] || [ -s "$boot/$current" ] || fail "the current kernel is missing"
+    if [ -z "$previous" ] || [ "$running" = "$current" ]; then
+        previous=$current
+        previous_release=$current_release
+    fi
+    cat > "$boot/lunarix.cfg.next" <<GRUB
+# lunarix-current $kernel
+# lunarix-previous $previous
+# lunarix-current-release $release
+# lunarix-previous-release $previous_release
+set default=0
+set timeout=2
+insmod all_video
+set gfxpayload=keep
+serial --unit=0 --speed=115200
+terminal_output console serial
+menuentry 'Lunarix' {
+    linux "\${cmdpath}/$kernel" root=PARTUUID=$root_partuuid lunarix.kernel=$kernel rootwait rw console=ttyS0,115200n8 console=tty0 loglevel=3
+}
+GRUB
+    if [ -n "$previous" ]; then
+        cat >> "$boot/lunarix.cfg.next" <<GRUB
+menuentry 'Lunarix (previous kernel)' {
+    linux "\${cmdpath}/$previous" root=PARTUUID=$root_partuuid lunarix.kernel=$previous rootwait rw console=ttyS0,115200n8 console=tty0 loglevel=3
+}
+GRUB
+    fi
+    sync
+    mv -f "$boot/lunarix.cfg.next" "$boot/lunarix.cfg"
+    sync
+    printf 'Prepared Lunarix kernel %s for the next boot\n' "$release"
+fi
+for file in "$boot"/lunarix-*.efi-kernel; do
+    [ -f "$file" ] || continue
+    case "${file##*/}" in "$kernel"|"$previous") ;; *) rm -- "$file" ;; esac
+done
+
+if [ "$previous" != vmlinuz ] && [ -f "$boot/vmlinuz" ]; then
+    rm -- "$boot/vmlinuz"
+fi
+running_release=$(uname -r)
+for modules in /lib/modules/*; do
+    [ -d "$modules" ] && [ ! -L "$modules" ] && [ -f "$modules/.lunarix-managed" ] || continue
+    case "${modules##*/}" in "$release"|"$previous_release"|"$running_release") ;; *) rm -rf -- "$modules" ;; esac
+done

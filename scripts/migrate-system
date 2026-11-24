@@ -1,0 +1,51 @@
+#!/bin/sh
+set -eu
+export PATH=/sbin:/bin:/usr/sbin:/usr/bin
+
+fail() { printf 'lunarix-migrate: %s\n' "$*" >&2; exit 1; }
+[ "$(id -u)" = 0 ] || fail "run as root inside the installed system"
+media="$(cd "$(dirname -- "$0")/.." && pwd)"
+baseline="$media/migration/baseline"
+repo="$media/system"
+[ -d "$baseline" ] && [ -d "$repo" ] || fail "migration media is incomplete"
+if [ -e /run/live-device ]; then fail "run on the installed system"; fi
+
+case "$(pkgr --version)" in
+    'pkgr 0.2.'*|'pkgr 0.3.'*|'pkgr 0.4.'*)
+        pkgr upgrade "$media/packages/pkgr-update.pkgr.tar.gz" ;;
+esac
+
+for package in lunarix-busybox lunarix-base lunarix-ca-certificates lunarix-net lunarix-firmware; do
+    if ! pkgr info "$package" >/dev/null 2>&1; then
+        set -- "$baseline/$package"-*.pkgr.tar.gz
+        [ "$#" = 1 ] && [ -f "$1" ] || fail "missing baseline for $package"
+        pkgr adopt "$1"
+    fi
+done
+
+if [ ! -s /etc/lunarix/boot.conf ]; then
+    root_device=$(awk '$5 == "/" { print $3; exit }' /proc/self/mountinfo)
+    [ -e "/sys/dev/block/$root_device/partition" ] || fail "could not find the installed partition"
+    disk=$(dirname "$(readlink -f "/sys/dev/block/$root_device")")
+    esp_uuid=
+    for partition in "$disk"/*; do
+        [ -e "$partition/partition" ] || continue
+        fs=$(blkid "/dev/${partition##*/}" || true)
+        case "$fs" in
+            *'LABEL="LUNARIX_EFI"'*'TYPE="vfat"'*)
+                [ -z "$esp_uuid" ] || fail "multiple Lunarix EFI partitions on the installed disk"
+                esp_uuid=$(printf '%s\n' "$fs" | sed -n 's/.* UUID="\([^"]*\)".*/\1/p') ;;
+        esac
+    done
+    root_partuuid=$(awk '{
+        for (i=1; i<=NF; i++) if ($i ~ /^root=PARTUUID=/) {sub(/^root=PARTUUID=/, "", $i); print $i; exit}
+    }' /proc/cmdline)
+    [ -n "$esp_uuid" ] && [ -n "$root_partuuid" ] || fail "could not locate the installed EFI and root volumes"
+    mkdir -p /etc/lunarix
+    printf '%s %s\n' "$esp_uuid" "$root_partuuid" > /etc/lunarix/boot.conf.next
+    mv -f /etc/lunarix/boot.conf.next /etc/lunarix/boot.conf
+fi
+if ! pkgr info linux-lunarix >/dev/null 2>&1; then
+    pkgr --repo "$repo" install linux-lunarix
+fi
+pkgr --repo "$repo" upgrade --all

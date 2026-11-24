@@ -18,25 +18,44 @@ fi
 
 if [[ "${1:-}" == "--archive" && $# -eq 1 ]]; then
     bash "$SCRIPT_DIR/build-userspace"
+    "$SCRIPT_DIR/build-base"
     TEMP_ROOT="$(mktemp -d "$BUILD_DIR/.installed-root.XXXXXX")"
     ARCHIVE="$(mktemp "$BUILD_DIR/.installed-root.tar.gz.XXXXXX")"
     trap 'rm -rf -- "$TEMP_ROOT"; rm -f -- "$ARCHIVE"' EXIT
 
-    cp -a "$STAGING/." "$PROJECT_ROOT/installed-root/." "$TEMP_ROOT/"
-    install -d "$TEMP_ROOT"/{dev,proc,sys,run,home,mnt,boot/efi,var/log,usr/local}
-    install -d -m 0700 "$TEMP_ROOT/root"
-    install -d -m 1777 "$TEMP_ROOT/tmp"
-    chmod 0600 "$TEMP_ROOT/etc/shadow"
+    full="$TEMP_ROOT/full"
+    skeleton="$TEMP_ROOT/skeleton"
+    mkdir -p "$full" "$skeleton"
+    cp -a "$STAGING/." "$PROJECT_ROOT/installed-root/." "$BUILD_DIR/base-root/." "$full/"
+    unsquashfs -quiet -no-progress -f -d "$full/usr/lib/lunarix/network" "$BUILD_DIR/network.squashfs"
 
-    MODULES="$BUILD_DIR/kernel/$(cat "$PROJECT_ROOT/config/kernel/version")/modules/lib/modules"
-    [[ -d "$MODULES" ]] || {
-        echo "error: build the kernel before creating the installed archive" >&2
-        exit 1
-    }
-    mkdir -p "$TEMP_ROOT/lib/modules"
-    rsync -a --exclude=build --exclude=source "$MODULES/" "$TEMP_ROOT/lib/modules/"
+    version="$(cat "$PROJECT_ROOT/config/kernel/version")"
+    release="${LUNARIX_SYSTEM_RELEASE:-$(cat "$PROJECT_ROOT/config/system-release")}"
+    "$SCRIPT_DIR/package-system" "$BUILD_DIR/base-root/usr/bin/pkgr" "$full" \
+        "$TEMP_ROOT/repo" "$release" "$BUILD_DIR/kernel/$version" "$BUILD_DIR/installed.efi"
+    "$SCRIPT_DIR/build-admin-tools" "$BUILD_DIR/base-root/usr/bin/pkgr" "$BUILD_DIR/distfiles" \
+        "$TEMP_ROOT/repo" "$BUILD_DIR/base-root/usr/share/pkgr/repo"
+    rm -rf -- "$BUILD_DIR/system-repo"
+    mv -- "$TEMP_ROOT/repo" "$BUILD_DIR/system-repo"
 
-    tar -C "$TEMP_ROOT" --owner=0 --group=0 --numeric-owner -czf "$ARCHIVE" .
+    install -d "$skeleton"/{dev,proc,sys,run,home,mnt,boot/efi,var/log,usr/local,etc}
+    install -d -m 0700 "$skeleton/root"
+    install -d -m 1777 "$skeleton/tmp"
+    for file in group hostname passwd; do
+        install -m644 "$full/etc/$file" "$skeleton/etc/$file"
+    done
+    install -m600 "$full/etc/shadow" "$skeleton/etc/shadow"
+    install -d "$skeleton/usr/share/pkgr"
+    cp -a "$BUILD_DIR/base-root/usr/share/pkgr/repo" "$skeleton/usr/share/pkgr/"
+    if [[ -n "${LUNARIX_REPO_URL:-}" || -n "${LUNARIX_REPO_KEY:-}" ]]; then
+        [[ "${LUNARIX_REPO_URL:-}" == https://* && -s "${LUNARIX_REPO_KEY:-}" ]] || {
+            echo "error: set both LUNARIX_REPO_URL and LUNARIX_REPO_KEY for a signed repository" >&2
+            exit 1
+        }
+        install -Dm644 "$LUNARIX_REPO_KEY" "$skeleton/etc/pkgr/repo.pem"
+        printf '%s\n' "$LUNARIX_REPO_URL" > "$skeleton/etc/pkgr/repository"
+    fi
+    tar -C "$skeleton" --owner=0 --group=0 --numeric-owner -czf "$ARCHIVE" .
     chmod 0644 "$ARCHIVE"
     mv -f -- "$ARCHIVE" "$BUILD_DIR/installed-root.tar.gz"
     exit

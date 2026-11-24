@@ -5,6 +5,8 @@ mount -t proc proc /proc
 mount -t sysfs sysfs /sys
 mkdir -p /run/live /dev/pts
 mount -t devpts devpts /dev/pts
+install -d -m 1777 /tmp
+ip link set lo up
 
 shell=/bin/sh
 for _ in 1 2 3 4 5 6 7 8 9 10; do
@@ -24,6 +26,12 @@ for _ in 1 2 3 4 5 6 7 8 9 10; do
 done
 
 if [ -s /run/live-device ]; then
+    mount -t squashfs -o loop,ro /run/live/network.squashfs /usr/lib/lunarix/network ||
+        echo 'Lunarix could not mount the network tools.'
+    for package in /run/live/packages/*.pkgr.tar.gz; do
+        [ -f "$package" ] || continue
+        ln -s "$package" /usr/share/pkgr/repo/
+    done
     echo 'Welcome to Lunarix Live. Run lunarix-install to install to disk.'
 else
     echo 'Lunarix installation media could not be mounted.'

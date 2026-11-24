@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+iso=$1
+destination=$2
+root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+work="$(mktemp -d)"
+trap 'rm -rf -- "$work"' EXIT
+mkdir -p "$work/root"
+xorriso -osirrox on -indev "$iso" \
+    -extract /installed-root.tar.gz "$work/rootfs.tar.gz" \
+    -extract /network.squashfs "$work/network.squashfs" >/dev/null
+tar -xzf "$work/rootfs.tar.gz" -C "$work/root"
+unsquashfs -quiet -no-progress -f -d "$work/root/usr/lib/lunarix/network" "$work/network.squashfs"
+"$root/scripts/package-system" "$root/build/base-root/usr/bin/pkgr" \
+    "$work/root" "$destination/baseline" 0.4.0-1
+install -Dm755 "$root/scripts/migrate-system" "$destination/migrate"

@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+VM_DIR="${LUNARIX_VM_DIR:-${LUNARA_VM_DIR:-$ROOT/build/qemu}}"
+
+usage() {
+    echo 'Usage: scripts/reset-vm'
+    echo 'Erase the selected QEMU disk and UEFI settings after confirmation.'
+    echo 'Set LUNARIX_VM_DIR to reset a different Lunarix VM.'
+}
+
+if [[ $# -ne 0 ]]; then
+    if [[ $# -eq 1 && ( "$1" == -h || "$1" == --help ) ]]; then
+        usage
+        exit 0
+    fi
+    usage >&2
+    exit 2
+fi
+
+if [[ ! -d "$VM_DIR" ]]; then
+    echo "No saved QEMU state in $VM_DIR."
+    exit 0
+fi
+VM_DIR="$(cd -- "$VM_DIR" && pwd -P)"
+command -v flock >/dev/null || { echo 'error: flock is required' >&2; exit 1; }
+exec 9>>"$VM_DIR/launch.lock"
+flock -n 9 || { echo "error: a VM is already running in $VM_DIR" >&2; exit 1; }
+
+files=()
+for name in lunarix.qcow2 lunara.qcow2 OVMF_VARS.fd; do
+    file="$VM_DIR/$name"
+    if [[ -f "$file" || -L "$file" ]]; then
+        files+=("$file")
+    elif [[ -e "$file" ]]; then
+        echo "error: expected a file at $file" >&2
+        exit 1
+    fi
+done
+if [[ ${#files[@]} -eq 0 ]]; then
+    echo "No saved QEMU state in $VM_DIR."
+    exit 0
+fi
+
+echo 'The following QEMU files will be erased:'
+printf '  %s\n' "${files[@]}"
+printf 'Type RESET to continue: '
+if ! IFS= read -r confirmation || [[ "$confirmation" != RESET ]]; then
+    echo 'Reset cancelled.'
+    exit 1
+fi
+
+rm -- "${files[@]}"
+echo "Reset QEMU state in $VM_DIR. The next live boot will create a blank disk."

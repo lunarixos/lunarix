@@ -10,32 +10,18 @@ TEMP_ROOT="$(mktemp -d "$BUILD/.live.XXXXXX")"
 TEMP_IMAGE="$(mktemp "$BUILD/.live.cpio.gz.XXXXXX")"
 trap 'rm -rf -- "$TEMP_ROOT"; rm -f -- "$TEMP_IMAGE"' EXIT
 
-cp -a "$BUILD/userspace/." "$TEMP_ROOT/"
+cp -a "$BUILD/userspace/." "$BUILD/base-root/." "$TEMP_ROOT/"
+MODULES="$BUILD/kernel/$(cat "$ROOT/config/kernel/version")/modules/lib/modules"
+mkdir -p "$TEMP_ROOT/lib/modules"
+rsync -a --exclude=build --exclude=source "$MODULES/" "$TEMP_ROOT/lib/modules/"
 install -d "$TEMP_ROOT"/{dev,proc,sys,run,mnt,lib/install-tools,usr/sbin}
 install -m 0755 "$ROOT/live/init" "$TEMP_ROOT/init"
 install -m 0755 "$ROOT/live/lunarix-install" "$TEMP_ROOT/usr/sbin/lunarix-install"
 
 # Keep the partitioner and real ext4 formatter, including their private
-# runtime libraries, in the live image. The installed root uses static BusyBox.
-TOOL_DIR="$TEMP_ROOT/lib/install-tools"
-for tool in sfdisk mkfs.ext4; do
-    binary="$(command -v "$tool")"
-    install -m 0755 "$binary" "$TOOL_DIR/$tool"
-    dependencies="$(LC_ALL=C ldd "$binary")"
-    if [[ "$dependencies" == *"not found"* ]]; then
-        echo "error: missing runtime libraries for $tool" >&2
-        exit 1
-    fi
-    while read -r name path; do
-        install -m 0755 "$path" "$TOOL_DIR/$name"
-    done < <(awk '{ n = split($1, p, "/") }
-                  $2 == "=>" && $3 ~ /^\// {print p[n], $3; next}
-                  $1 ~ /^\// {print p[n], $1}' <<< "$dependencies")
-done
-[[ -x "$TOOL_DIR/ld-linux-x86-64.so.2" ]] || {
-    echo "error: live tools require the x86-64 glibc loader on the build host" >&2
-    exit 1
-}
+# runtime libraries, in the live image.
+"$ROOT/scripts/stage-programs" "$TEMP_ROOT/lib/install-tools" \
+    "$(command -v sfdisk)" "$(command -v mkfs.ext4)"
 [[ ! -f /etc/mke2fs.conf ]] || install -Dm644 /etc/mke2fs.conf "$TEMP_ROOT/etc/mke2fs.conf"
 
 (cd "$TEMP_ROOT" && find . -print0 | cpio --null -o -H newc --owner=0:0 | gzip -9) > "$TEMP_IMAGE"

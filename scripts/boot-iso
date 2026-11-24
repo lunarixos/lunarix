@@ -2,23 +2,25 @@
 set -euo pipefail
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
-ISO="$ROOT/build/lunarix.iso"
+ISO="${LUNARIX_ISO:-$ROOT/build/lunarix.iso}"
 VM_DIR="${LUNARIX_VM_DIR:-${LUNARA_VM_DIR:-$ROOT/build/qemu}}"
 DISK="$VM_DIR/lunarix.qcow2"
 VARS="$VM_DIR/OVMF_VARS.fd"
-if [[ ! -e "$DISK" && -f "$VM_DIR/lunara.qcow2" ]]; then
-    DISK="$VM_DIR/lunara.qcow2"
-fi
 
 usage() {
     cat <<'USAGE'
 Usage: scripts/boot-iso [--installed] [--serial]
 
-Boot the live ISO by default. Use --installed to boot the saved disk alone.
+Boot the live ISO by default. Use --installed to boot the saved disk.
+Set LUNARIX_ISO to select a different image or attach it read-only when
+booting with --installed.
+Live boots use temporary UEFI settings and retain the saved disk.
 Use --serial for a terminal-only session, then select Lunarix Live (serial)
 in GRUB when booting the ISO. Press Ctrl+A, then X to close serial QEMU.
 
 LUNARIX_VM_DIR sets the directory for the guest disk and UEFI settings.
+LUNARIX_VM_MEMORY sets the guest RAM, for example 2G (default 256M).
+LUNARIX_VM_CPU selects a QEMU CPU model, for example max.
 Set OVMF_CODE and OVMF_VARS together to use a custom firmware pair.
 USAGE
 }
@@ -34,16 +36,9 @@ for option in "$@"; do
     esac
 done
 
-if "$installed"; then
-    [[ -s "$DISK" ]] || {
-        echo "error: no QEMU disk at $DISK. Start with scripts/boot-iso and run lunarix-install in the guest." >&2
-        exit 1
-    }
-else
-    [[ -s "$ISO" ]] || {
-        echo "error: no live ISO at $ISO. Run scripts/build-iso first." >&2
-        exit 1
-    }
+if { ! "$installed" || [[ -n "${LUNARIX_ISO:-}" ]]; } && [[ ! -s "$ISO" ]]; then
+    echo "error: no live ISO at $ISO. Run scripts/build-iso first." >&2
+    exit 1
 fi
 
 for tool in qemu-system-x86_64 flock; do
@@ -70,8 +65,16 @@ fi
 }
 
 mkdir -p -- "$VM_DIR"
-exec 9>"$VM_DIR/launch.lock"
+exec 9>>"$VM_DIR/launch.lock"
 flock -n 9 || { echo "error: a VM is already running in $VM_DIR" >&2; exit 1; }
+
+if [[ ! -e "$DISK" && -f "$VM_DIR/lunara.qcow2" ]]; then
+    DISK="$VM_DIR/lunara.qcow2"
+fi
+if "$installed" && [[ ! -s "$DISK" ]]; then
+    echo "error: no QEMU disk at $DISK. Start with scripts/boot-iso and run lunarix-install in the guest." >&2
+    exit 1
+fi
 
 temp_file=
 trap 'if [[ -n "$temp_file" ]]; then rm -f -- "$temp_file"; fi' EXIT
@@ -82,30 +85,53 @@ if [[ ! -e "$DISK" ]]; then
     mv -- "$temp_file" "$DISK"
     temp_file=
 fi
-if [[ ! -e "$VARS" ]]; then
+if ! "$installed"; then
+    temp_file="$(mktemp "$VM_DIR/.live-vars.XXXXXX")"
+    cat -- "$vars_template" > "$temp_file"
+    VARS="$temp_file"
+elif [[ ! -e "$VARS" ]]; then
     temp_file="$(mktemp "$VM_DIR/.vars.XXXXXX")"
     cat -- "$vars_template" > "$temp_file"
     mv -- "$temp_file" "$VARS"
     temp_file=
 fi
 
+disk_device=virtio-blk-pci,drive=lunarix-disk
+if "$installed"; then
+    disk_device+=,bootindex=1
+fi
 args=(
     -machine q35
-    -m 256M
+    -m "${LUNARIX_VM_MEMORY:-256M}"
     -smp 2
     -drive "if=pflash,format=raw,readonly=on,file=${code//,/,,}"
     -drive "if=pflash,format=raw,file=${VARS//,/,,}"
-    -drive "if=virtio,format=qcow2,file=${DISK//,/,,}"
+    -drive "if=none,id=lunarix-disk,format=qcow2,file=${DISK//,/,,}"
+    -device "$disk_device"
     -netdev "user,id=net"
     -device "virtio-net-pci,netdev=net"
 )
+if [[ -n "${LUNARIX_VM_CPU:-}" ]]; then
+    args+=(-cpu "$LUNARIX_VM_CPU")
+fi
 if "$installed"; then
-    args+=(-boot order=c)
     echo "==> Booting the installed disk: $DISK"
+    if [[ -n "${LUNARIX_ISO:-}" ]]; then
+        args+=(-drive "if=none,id=lunarix-media,format=raw,media=cdrom,readonly=on,file=${ISO//,/,,}"
+               -device "ide-cd,drive=lunarix-media")
+        echo "    Attached package media: $ISO"
+    fi
 else
-    args+=(-cdrom "$ISO" -boot order=d)
+    args+=(
+        -drive "if=none,id=lunarix-live,format=raw,media=cdrom,readonly=on,file=${ISO//,/,,}"
+        -device "ide-cd,drive=lunarix-live,bootindex=1"
+    )
     echo "==> Booting the live ISO: $ISO"
-    echo '    Inside the guest, run lunarix-install and select /dev/vda.'
+    echo "    Attached virtual disk: $DISK"
+    echo '    Inside the guest, run lunarix-install and select /dev/vda to install.'
+    if "$serial"; then
+        echo '    Select Lunarix Live (serial) in GRUB.'
+    fi
 fi
 if "$serial"; then
     args+=(-nographic)

@@ -16,9 +16,11 @@ case "$1" in
             break
         done
         if [ -n "${dns:-}" ]; then
+            umask 022
             for nameserver in $dns; do
                 printf 'nameserver %s\n' "$nameserver"
             done > /etc/resolv.conf
+            chmod a+r /etc/resolv.conf
         fi
         ;;
 esac

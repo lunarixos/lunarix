@@ -1,0 +1,175 @@
+#!/bin/sh
+set -eu
+trap 'exit 1' HUP INT TERM
+export PATH=/sbin:/bin:/usr/sbin:/usr/bin
+umask 077
+
+usage() {
+    cat <<'EOF'
+Usage:
+  lunarix-net status
+  lunarix-net ethernet INTERFACE
+  lunarix-net wifi list [INTERFACE]
+  lunarix-net wifi connect SSID [INTERFACE]
+  lunarix-net wifi disconnect [INTERFACE]
+EOF
+}
+
+fail() {
+    printf '%s\n' "$*" >&2
+    exit 1
+}
+
+select_interface() {
+    iface=$1
+    case "$iface" in
+        ''|.|..|*[!a-zA-Z0-9_.:-]*) fail 'Invalid network interface name.' ;;
+    esac
+    [ -e "/sys/class/net/$iface" ] || fail "Interface $iface does not exist."
+    state="/run/lunarix-net/$iface"
+    mkdir -p "$state"
+    exec 9>"$state/lock"
+    flock -x 9
+}
+
+select_wifi() {
+    for device in /sys/bus/pci/devices/*; do
+        [ -r "$device/class" ] || continue
+        [ "$(cat "$device/class")" = 0x028000 ] || continue
+        [ -L "$device/driver" ] && continue
+        modprobe -q "$(cat "$device/modalias")" || :
+    done
+
+    iface=$1
+    if [ -z "$iface" ]; then
+        for device in /sys/class/net/*/phy80211; do
+            [ -e "$device" ] || continue
+            [ -z "$iface" ] || fail 'Multiple Wi-Fi adapters found. Specify the interface.'
+            iface=${device%/phy80211}
+            iface=${iface##*/}
+        done
+        [ -n "$iface" ] || fail 'No Wi-Fi adapter found. Check the driver, firmware, and radio switch.'
+    fi
+    select_interface "$iface"
+    [ -e "/sys/class/net/$iface/phy80211" ] || fail "$iface is not a Wi-Fi interface."
+}
+
+wifi_control() {
+    wpa_cli -p "$state/control" -i "$iface" "$@"
+}
+
+start_wifi() {
+    if [ "$(wifi_control ping 2>/dev/null)" = PONG ]; then
+        return
+    fi
+    printf 'ctrl_interface=%s/control\n' "$state" > "$state/wpa.conf"
+    ip link set dev "$iface" up
+    wpa_supplicant -B -D nl80211 -i "$iface" -c "$state/wpa.conf" 9>&-
+}
+
+stop_wifi() {
+    wifi_control terminate >/dev/null 2>&1 || :
+    rm -f -- "$state/wpa.conf"
+}
+
+stop_dhcp() {
+    if [ -s "$state/dhcp.pid" ]; then
+        start-stop-daemon -K -q -p "$state/dhcp.pid" -n udhcpc || :
+        rm -f -- "$state/dhcp.pid"
+    fi
+}
+
+start_dhcp() {
+    udhcpc -n -p "$state/dhcp.pid" -i "$iface" 9>&- ||
+        fail "No IPv4 DHCP lease for $iface."
+}
+
+scan_wifi() {
+    if [ "$(wifi_control ping 2>/dev/null)" != PONG ]; then
+        trap stop_wifi EXIT
+        start_wifi
+    fi
+    [ "$(wifi_control scan)" = OK ] || fail "Could not start a Wi-Fi scan on $iface."
+    for _ in 1 2 3 4 5 6; do
+        sleep 1
+        results=$(wifi_control scan_results)
+        if [ "$(printf '%s\n' "$results" | wc -l)" -gt 1 ]; then
+            break
+        fi
+    done
+    printf '%s\n' "$results"
+}
+
+connect_wifi() {
+    ssid_hex=$(printf '%s' "$1" | od -An -v -tx1 | tr -d ' \n')
+    [ "${#ssid_hex}" -ge 2 ] && [ "${#ssid_hex}" -le 64 ] ||
+        fail 'The network name must be 1 to 32 bytes.'
+    [ -t 0 ] || fail 'Run Wi-Fi connect from a terminal to enter the passphrase.'
+    printf 'Wi-Fi password: ' >&2
+    keys=$(wpa_passphrase "$1") || fail 'Enter a WPA personal passphrase of 8 to 63 characters.'
+    printf '\n' >&2
+    psk=$(printf '%s\n' "$keys" | sed -n 's/^[[:space:]]*psk=//p')
+    sae_password=$(printf '%s\n' "$keys" | sed -n 's/^[[:space:]]*#psk="\(.*\)"$/\1/p' |
+        tr -d '\n' | od -An -v -tx1 | tr -d ' \n')
+    unset keys
+    [ "${#psk}" -eq 64 ] && [ -n "$sae_password" ] || fail 'Could not derive Wi-Fi credentials.'
+
+    stop_dhcp
+    trap stop_wifi EXIT
+    start_wifi
+    [ "$(wifi_control disconnect)" = OK ] || fail "Could not reset Wi-Fi on $iface."
+    {
+        printf 'ctrl_interface=%s/control\n' "$state"
+        printf 'network={\n\tssid=%s\n\tpsk=%s\n\tsae_password=%s\n' "$ssid_hex" "$psk" "$sae_password"
+        printf '\tkey_mgmt=WPA-PSK SAE\n\tieee80211w=1\n}\n'
+    } > "$state/wpa.conf"
+    unset psk sae_password
+    [ "$(wifi_control reconfigure)" = OK ] || fail "Could not configure Wi-Fi on $iface."
+    [ "$(wifi_control reconnect)" = OK ] || fail "Could not start association on $iface."
+    for _ in $(seq 20); do
+        if wifi_control status | grep -qx 'wpa_state=COMPLETED'; then
+            rm -f -- "$state/wpa.conf"
+            start_dhcp
+            trap - EXIT
+            printf 'Connected on %s.\n' "$iface"
+            return
+        fi
+        sleep 1
+    done
+    fail "Wi-Fi association timed out on $iface. Check the password and signal."
+}
+
+case "${1:-}" in
+    -h|--help) usage; exit 0 ;;
+    status) ip address show; ip route show; exit 0 ;;
+esac
+[ "$(id -u)" -eq 0 ] || fail 'Run this command as root.'
+case "${1:-}:${2:-}" in
+    ethernet:*)
+        [ "$#" -eq 2 ] || { usage >&2; exit 1; }
+        select_interface "$2"
+        [ "$iface" != lo ] && [ ! -e "/sys/class/net/$iface/phy80211" ] ||
+            fail "$iface is not an Ethernet interface."
+        stop_dhcp
+        ip link set dev "$iface" up
+        start_dhcp
+        ;;
+    wifi:list)
+        [ "$#" -le 3 ] || { usage >&2; exit 1; }
+        select_wifi "${3:-}"
+        scan_wifi
+        ;;
+    wifi:connect)
+        [ "$#" -ge 3 ] && [ "$#" -le 4 ] || { usage >&2; exit 1; }
+        select_wifi "${4:-}"
+        connect_wifi "$3"
+        ;;
+    wifi:disconnect)
+        [ "$#" -le 3 ] || { usage >&2; exit 1; }
+        select_wifi "${3:-}"
+        stop_dhcp
+        stop_wifi
+        ip -4 addr flush dev "$iface"
+        ;;
+    *) usage >&2; exit 1 ;;
+esac

@@ -1,0 +1,126 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+BUILD="$ROOT/build"
+FIRMWARE_DIR="${LUNARIX_FIRMWARE_DIR:-/lib/firmware}"
+CA_BUNDLE="${LUNARIX_CA_BUNDLE:-/etc/ssl/certs/ca-certificates.crt}"
+LOCAL_PKGR="${PKGR_SOURCE_DIR:-$ROOT/../pkgr}"
+REVISION="$(cat "$ROOT/config/pkgr.commit")"
+mkdir -p "$BUILD"
+work="$(mktemp -d "$BUILD/.base.XXXXXX")"
+trap 'rm -rf -- "$work"' EXIT
+source_tree="$work/pkgr"
+package_root="$work/package"
+base_root="$work/root"
+
+for tool in make git cmake mksquashfs wpa_supplicant wpa_cli wpa_passphrase openssl curl; do
+    command -v "$tool" >/dev/null || { echo "error: $tool is required" >&2; exit 1; }
+done
+
+mkdir -p "$source_tree" "$package_root" "$base_root"
+if [[ -n "${PKGR_WORKTREE:-}" ]]; then
+    pkgr_sources=tests/src
+    if [[ -f "$PKGR_WORKTREE/src/main.c" ]]; then
+        pkgr_sources=src
+    fi
+    if [[ ! -f "$PKGR_WORKTREE/$pkgr_sources/main.c" ]]; then
+        echo "error: pkgr sources are missing from $PKGR_WORKTREE" >&2
+        exit 1
+    fi
+    install -m644 "$PKGR_WORKTREE/Makefile" "$source_tree/Makefile"
+    mkdir -p "$source_tree/$pkgr_sources"
+    rsync -a --exclude='*.o' --exclude='*.d' \
+        "$PKGR_WORKTREE/$pkgr_sources/" "$source_tree/$pkgr_sources/"
+    mkdir -p "$source_tree/packages"
+    cp -a -- "$PKGR_WORKTREE/packages/fastfetch" "$source_tree/packages/"
+elif [[ -d "$LOCAL_PKGR/.git" ]] && git -C "$LOCAL_PKGR" cat-file -e "$REVISION^{commit}" 2>/dev/null; then
+    git -C "$LOCAL_PKGR" archive "$REVISION" | tar -x -C "$source_tree"
+else
+    git -C "$source_tree" init -q
+    git -C "$source_tree" fetch --depth=1 https://github.com/lunarixos/pkgr.git "$REVISION"
+    git -C "$source_tree" checkout -q --detach FETCH_HEAD
+fi
+
+write_launcher() {
+    local root=$1 program=$2 library_path=$3
+    install -d "$root/usr/bin"
+    {
+        printf '%s\n' '#!/bin/sh'
+        if [[ "$program" == openssl ]]; then
+            printf '%s\n' "export SSL_CERT_FILE=\"\${SSL_CERT_FILE:-/usr/share/lunarix/ca-certificates.crt}\""
+        elif [[ "$program" == curl ]]; then
+            printf '%s\n' 'export CURL_CA_BUNDLE="${CURL_CA_BUNDLE:-/usr/share/lunarix/ca-certificates.crt}"'
+        fi
+        printf 'exec %s/ld-linux-x86-64.so.2 --library-path %s %s/%s "$@"\n' \
+            "$library_path" "$library_path" "$library_path" "$program"
+    } > "$root/usr/bin/$program"
+    chmod 0755 "$root/usr/bin/$program"
+}
+
+"$ROOT/scripts/build-static-pkgr" "$work" "$BUILD"
+pkgr="$source_tree/build/pkgr"
+install -Dm755 "$pkgr" "$package_root/usr/bin/pkgr"
+install -Dm644 "$work/libarchive-3.8.11/COPYING" "$package_root/usr/share/licenses/pkgr/libarchive"
+install -Dm644 "$work/zlib-1.4/LICENSE" "$package_root/usr/share/licenses/pkgr/zlib"
+for file in package.info build.sh; do
+    install -Dm644 "$source_tree/packages/fastfetch/$file" "$package_root/usr/share/pkgr/recipes/fastfetch/$file"
+done
+version="$("$pkgr" --version)"
+if [[ ! "$version" =~ ^pkgr\ ([0-9][0-9A-Za-z._+-]*)$ ]]; then
+    echo "error: unexpected pkgr version: $version" >&2
+    exit 1
+fi
+pkgr_version=${BASH_REMATCH[1]}
+if [[ "$(printf '%s\n' 0.5.3 "$pkgr_version" | sort -V | sed -n '1p')" != 0.5.3 ]]; then
+    echo "error: this ISO needs pkgr 0.5.3 or newer. Set PKGR_WORKTREE to the updated checkout." >&2
+    exit 1
+fi
+cat "$ROOT/config/pkgr.package" > "$work/pkgr.package"
+printf 'version=%s\n' "$pkgr_version" >> "$work/pkgr.package"
+archive="$(cd "$work" && "$pkgr" pack "$work/pkgr.package" "$package_root")"
+"$pkgr" --root "$base_root" install "$work/$archive"
+repository="$base_root/usr/share/pkgr/repo"
+install -d "$repository"
+fastfetch="$(cd "$work" && "$pkgr" build "$source_tree/packages/fastfetch")"
+install -m644 "$work/$fastfetch" "$repository/"
+
+network_tools=()
+for tool in wpa_supplicant wpa_cli wpa_passphrase openssl curl; do
+    network_tools+=("$(command -v "$tool")")
+    write_launcher "$base_root" "$tool" /usr/lib/lunarix/network
+done
+"$ROOT/scripts/stage-programs" "$work/network" "${network_tools[@]}"
+mksquashfs "$work/network" "$work/network.squashfs" \
+    -noappend -all-root -comp zstd -processors 2 -no-progress
+install -d "$base_root/usr/lib/lunarix/network"
+install -Dm644 "$CA_BUNDLE" "$base_root/usr/share/lunarix/ca-certificates.crt"
+install -Dm755 "$ROOT/installed-root/usr/sbin/lunarix-net" "$base_root/usr/sbin/lunarix-net"
+install -Dm755 "$ROOT/installed-root/usr/share/udhcpc/default.script" \
+    "$base_root/usr/share/udhcpc/default.script"
+
+install -d "$base_root/lib/firmware/rtw89"
+for name in rtw8852a_fw.bin rtw8852a_fw-1.bin; do
+    source_file="$FIRMWARE_DIR/rtw89/$name"
+    target_file="$base_root/lib/firmware/rtw89/$name"
+    if [[ -r "$source_file" ]]; then
+        install -m 0644 "$source_file" "$target_file"
+    elif [[ -r "$source_file.zst" ]]; then
+        zstd -dc "$source_file.zst" > "$target_file"
+    elif [[ -r "$source_file.xz" ]]; then
+        xz -dc "$source_file.xz" > "$target_file"
+    else
+        echo "error: firmware for RTL8852AE is missing: $source_file" >&2
+        exit 1
+    fi
+done
+for name in regulatory.db regulatory.db.p7s; do
+    if [[ -r "$FIRMWARE_DIR/$name" ]]; then
+        install -m 0644 "$FIRMWARE_DIR/$name" "$base_root/lib/firmware/$name"
+    fi
+done
+
+rm -rf -- "$BUILD/base-root"
+mv -- "$base_root" "$BUILD/base-root"
+mv -f -- "$work/network.squashfs" "$BUILD/network.squashfs"
+mv -f -- "$work/$archive" "$BUILD/pkgr-update.pkgr.tar.gz"

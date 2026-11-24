@@ -6,6 +6,12 @@ mkdir -p /dev/pts
 mount -t devpts devpts /dev/pts
 mount -t tmpfs -o mode=0755,nosuid,nodev tmpfs /run
 mount -o remount,rw /
+if [ -w /proc/sys/dev/tty/legacy_tiocsti ]; then
+    printf '0\n' > /proc/sys/dev/tty/legacy_tiocsti
+fi
+if ! /usr/bin/pkgr recover; then
+    echo 'Lunarix could not recover the package transaction.' >&2
+fi
 hostname -F /etc/hostname
 if [ -r /etc/vconsole.conf ]; then
     # shellcheck source=/dev/null
